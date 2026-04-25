@@ -10,9 +10,9 @@ import numpy as np
 
 from osr_parser import OsuReplay, GameMode, ModsBit
 from analyze_offsets import (
-    parse_beatmap, parse_replay_frames, detect_events,
-    match_events, build_statistics, compute_windows,
-    build_output,
+    parse_beatmap, parse_replay_frames, extract_actions,
+    action_driven_judge, build_statistics, compute_windows,
+    build_output, build_judgment_stats, classify_judgment,
 )
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -315,14 +315,22 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
     except Exception as e:
         return [gr.Markdown(f"⛔ Replay 帧解析失败: {e}")] + [gr.Dataframe(value=None)] * 10
 
-    windows = compute_windows(od)
-    press_events, release_events = detect_events(frames, cs)
-    offsets, match_extras = match_events(notes, press_events, release_events, cs, windows["miss"])
+    scorev2 = bool(replay.mods & ModsBit.SCORE_V2)
+    windows = compute_windows(od, scorev2=scorev2)
+    sv2_windows = compute_windows(od, scorev2=True)
+
+    actions = extract_actions(frames, cs)
+    offsets, missed, extra = action_driven_judge(notes, actions, windows, cs, scorev2=scorev2)
+    match_extras = {"extra_presses": extra, "extra_releases": 0}
     overall_stats, by_type_stats, by_column_stats = build_statistics(offsets, windows)
     result = build_output(
         meta, player, replay.mods, mods_names, cs, od, windows,
         notes, offsets, match_extras, overall_stats, by_type_stats, by_column_stats,
     )
+
+    # Build judgment stats matching osu! metadata semantics
+    jdg_windows = sv2_windows if scorev2 else windows
+    jdg_stats = build_judgment_stats(notes, offsets, jdg_windows, scorev2=scorev2)
 
     te = result["match_summary"]["total_entries"]
     me = result["match_summary"]["matched_entries"]
@@ -347,7 +355,6 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
             detail_rows.append(row)
 
     overall_rows = []
-    merged_jdg = defaultdict(int)
     for typ in ["tap", "hold_head", "hold_tail"]:
         if typ not in overall_stats:
             continue
@@ -357,12 +364,13 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
                d["std"], d["min"], d["max"]]
         row += [jc.get(j, 0) for j in JUDGMENT_ORDER]
         overall_rows.append(row)
-        for j in JUDGMENT_ORDER:
-            merged_jdg[j] += jc.get(j, 0)
 
-    merged_total = sum(merged_jdg.values())
-    summary_row = ["**总计**", "tap+head+tail", merged_total, "-", "-", "-", "-", "-"]
-    summary_row += [merged_jdg.get(j, 0) for j in JUDGMENT_ORDER]
+    # Merged summary row using judgment-stats (metadata-compatible)
+    jdg_total = sum(jdg_stats.values())
+    summary_row = ["**总计**",
+                   "tap+hold_head+hold_tail" if scorev2 else "tap+hold",
+                   jdg_total, "-", "-", "-", "-", "-"]
+    summary_row += [jdg_stats.get(j, 0) for j in JUDGMENT_ORDER]
 
     title = result["metadata"]["beatmap"]["title"]
     artist = result["metadata"]["beatmap"]["artist"]
@@ -385,7 +393,7 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
     comp_rows = []
     for osu_label, ana_label in OSU_TO_ANALYZER.items():
         osu_val = osu_jdg.get(osu_label, 0)
-        ana_val = merged_jdg.get(ana_label, 0)
+        ana_val = jdg_stats.get(ana_label, 0)
         diff = ana_val - osu_val
         comp_rows.append([osu_label, osu_val, ana_val, f"{diff:+d}" if diff != 0 else "0"])
 
@@ -404,6 +412,7 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
         "sorted_cols": sorted_cols,
         "press_durations": dict(press_durations),
         "osu_judgments": osu_jdg,
+        "scorev2": scorev2,
     }
 
     col_choices = [str(c) for c in sorted_cols]
@@ -492,11 +501,35 @@ def build_ui():
             col_checkbox = gr.CheckboxGroup(choices=[], value=[], label="显示列",
                                             interactive=True)
 
-        with gr.Row():
-            dist_plot = gr.Plot(label="偏移分布直方图")
-            press_time_plot = gr.Plot(label="按压时长分布 (PressTime)")
+        gr.HTML("""
+<style>
+.fs-wrap { position: relative; }
+.fs-btn {
+    position: absolute; top: 4px; right: 8px; z-index: 100;
+    background: rgba(128,128,128,0.15); border: none; border-radius: 4px;
+    cursor: pointer; font-size: 18px; line-height: 1; padding: 2px 6px;
+    color: inherit; transition: background 0.15s;
+}
+.fs-btn:hover { background: rgba(128,128,128,0.4); }
+.fs-wrap:-webkit-full-screen { background: var(--bg,#fff); padding: 20px; }
+.fs-wrap:-moz-full-screen { background: var(--bg,#fff); padding: 20px; }
+.fs-wrap:fullscreen { background: var(--bg,#fff); padding: 20px; }
+.fs-wrap:-webkit-full-screen .plotly-graph-div { width: 100% !important; height: 100% !important; }
+.fs-wrap:fullscreen .plotly-graph-div { width: 100% !important; height: 100% !important; }
+</style>
+""")
 
-        pie_plot = gr.Plot(label="判定分布饼图")
+        with gr.Row():
+            with gr.Column(scale=1, elem_classes="fs-wrap"):
+                dist_plot = gr.Plot(label="偏移分布直方图", elem_id="hist-plot")
+                gr.HTML('<button class="fs-btn" onclick="document.getElementById(\'hist-plot\').closest(\'.fs-wrap\').requestFullscreen()">⛶</button>')
+            with gr.Column(scale=1, elem_classes="fs-wrap"):
+                press_time_plot = gr.Plot(label="按压时长分布 (PressTime)", elem_id="press-plot")
+                gr.HTML('<button class="fs-btn" onclick="document.getElementById(\'press-plot\').closest(\'.fs-wrap\').requestFullscreen()">⛶</button>')
+
+        with gr.Column(elem_classes="fs-wrap"):
+            pie_plot = gr.Plot(label="判定分布饼图", elem_id="pie-plot")
+            gr.HTML('<button class="fs-btn" onclick="document.getElementById(\'pie-plot\').closest(\'.fs-wrap\').requestFullscreen()">⛶</button>')
 
         # Events
         analyze_btn.click(
