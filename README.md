@@ -25,7 +25,7 @@ python webui.py
 Opens at `http://127.0.0.1:7860`. Upload a `.osr` replay file (required) and optionally a `.osu` beatmap. Configure the osu! Songs directory in settings for automatic beatmap lookup.
 
 #### Example
-![](assets\example.png)
+![eg](assets/example.png)
 ## Project Structure
 
 ```
