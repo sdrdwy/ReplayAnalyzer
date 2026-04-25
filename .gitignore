@@ -1,1 +1,5 @@
 examples
+*.pyc
+__pycache__
+.vscode
+.webui_tmp
