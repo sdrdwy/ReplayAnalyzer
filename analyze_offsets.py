@@ -211,6 +211,14 @@ def action_driven_judge(notes, actions, windows, cs, scorev2=False):
                         "offset_ms": head_offset, "hit_time_ms": note["time"], "event_time_ms": action["time"],
                         "head_offset": head_offset, "tail_offset": tail_offset,
                     })
+                    all_offsets.append({
+                        "column": note["column"], "type": "hold_head",
+                        "offset_ms": head_offset, "hit_time_ms": note["time"], "event_time_ms": action["time"],
+                    })
+                    all_offsets.append({
+                        "column": note["column"], "type": "hold_tail",
+                        "offset_ms": tail_offset, "hit_time_ms": note["end_time"], "event_time_ms": action["end_time"],
+                    })
             break  # action consumed, move to next action
 
     # Remaining notes = missed
@@ -305,7 +313,9 @@ def build_judgment_stats(notes, offsets, windows, scorev2=False):
     result = Counter()
     if not scorev2:
         for o in offsets:
-            if o["offset_ms"] is None: continue
+            if o["offset_ms"] is None:
+                result["MISS"] += 1
+                continue
             if o["type"] == "hold":
                 result[classify_combined_hold(o["head_offset"], o["tail_offset"], windows)] += 1
             elif o["type"] in ("tap",):
@@ -313,7 +323,9 @@ def build_judgment_stats(notes, offsets, windows, scorev2=False):
     else:
         tail_win = {k: v * 1.5 for k, v in windows.items()}
         for o in offsets:
-            if o["offset_ms"] is None: continue
+            if o["offset_ms"] is None:
+                result["MISS"] += 1
+                continue
             if o["type"] == "hold_head":
                 result[classify_judgment(o["offset_ms"], windows)] += 1
             elif o["type"] == "hold_tail":
@@ -338,13 +350,17 @@ def build_output(meta, player, mods_value, mods_names, cs, od, windows,
     offset_list = []
     for o in offsets:
         if o["offset_ms"] is not None:
-            offset_list.append({
+            entry = {
                 "column": o["column"],
                 "type": o["type"],
                 "offset_ms": o["offset_ms"],
                 "hit_time_ms": o["hit_time_ms"],
                 "event_time_ms": o["event_time_ms"],
-            })
+            }
+            if "head_offset" in o:
+                entry["head_offset"] = o["head_offset"]
+                entry["tail_offset"] = o["tail_offset"]
+            offset_list.append(entry)
     max_note_time = max(n["time"] for n in notes) if notes else 0
     return {
         "metadata": {

@@ -13,11 +13,12 @@ from analyze_offsets import (
     parse_beatmap, parse_replay_frames, extract_actions,
     action_driven_judge, build_statistics, compute_windows,
     build_output, build_judgment_stats, classify_judgment,
+    classify_combined_hold,
 )
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 CASES_DIR = os.path.join(THIS_DIR, "cases")
-CONFIG_PATH = os.path.join(THIS_DIR, "config.json")
+SETTINGS_PATH = os.path.join(THIS_DIR, "settings.json")
 TEMP_DIR = os.path.join(THIS_DIR, ".webui_tmp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -43,15 +44,17 @@ COLORS_PALETTE = [
 MODE_LABELS = ["press (tap+head)", "hold_head", "hold_tail", "all (tap+head+tail)"]
 
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+def load_settings():
+    if os.path.exists(SETTINGS_PATH):
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"songs_path": ""}
+    default = {"songs_path": ""}
+    save_settings(default)
+    return default
 
 
-def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+def save_settings(cfg):
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
@@ -64,10 +67,10 @@ def compute_file_md5(path):
 
 
 def find_osu_by_md5(target_md5):
-    config = load_config()
+    settings = load_settings()
     search_dirs = [CASES_DIR]
-    if config.get("songs_path"):
-        search_dirs.append(config["songs_path"])
+    if settings.get("songs_path"):
+        search_dirs.append(settings["songs_path"])
     for root_dir in search_dirs:
         if not os.path.isdir(root_dir):
             continue
@@ -80,6 +83,51 @@ def find_osu_by_md5(target_md5):
                             return full
                     except Exception:
                         continue
+    return None
+
+
+def parse_replay_filename(filename):
+    """
+    Parse osu! replay filename to extract artist, title, difficulty.
+    Expected format: "player - artist - title [difficulty] (date) mode.osr"
+    Example: "Tomor1n - MIMI feat. wanko - Minimum [Luminesense] (2025-11-22) OsuMania.osr"
+    Returns dict with artist, title, difficulty or None.
+    """
+    base = os.path.splitext(os.path.basename(filename))[0]
+    parts = base.split(" - ")
+    if len(parts) < 3:
+        return None
+    artist = parts[1]
+    rest = " - ".join(parts[2:])
+    lb = rest.find("[")
+    rb = rest.find("]")
+    if lb == -1 or rb == -1 or lb == 0:
+        return None
+    title = rest[:lb].strip()
+    difficulty = rest[lb + 1:rb].strip()
+    return {"artist": artist, "title": title, "difficulty": difficulty}
+
+
+def find_osu_by_filename(osr_path, songs_path):
+    """
+    Search Songs directory for a .osu file matching replay filename.
+    .osu files are named: "Artist - Title (Mapper) [Difficulty].osu"
+    Matches by title (fuzzy) + [difficulty] (exact bracket).
+    """
+    info = parse_replay_filename(os.path.basename(osr_path))
+    if not info or not os.path.isdir(songs_path):
+        return None
+    diff_bracket = f"[{info['difficulty']}]"
+    title_lower = info["title"].lower()
+    for dirpath, _, fnames in os.walk(songs_path):
+        for fn in fnames:
+            if not fn.lower().endswith(".osu"):
+                continue
+            if diff_bracket not in fn:
+                continue
+            fn_name = os.path.splitext(fn)[0]
+            if title_lower in fn_name.lower():
+                return os.path.join(dirpath, fn)
     return None
 
 
@@ -107,7 +155,7 @@ def compute_press_durations(frames, cs):
     return by_col
 
 
-def build_histogram_figure(state, mode_label, selected_keys):
+def build_histogram_figure(state, mode_label, selected_keys, bin_count=80):
     if not state:
         return go.Figure()
     type_map = {
@@ -137,7 +185,7 @@ def build_histogram_figure(state, mode_label, selected_keys):
 
     w = state["windows"]
     max_abs = max(max(all_vals), -min(all_vals), w["miss"] + 50)
-    nbins = 80
+    nbins = max(bin_count, 5)
     bin_width = 2 * max_abs / nbins
 
     fig = go.Figure()
@@ -285,11 +333,221 @@ def build_rolling_charts(state, window_size_ms):
     return fig_avg, fig_ur
 
 
+PREVIEW_COLORS = {
+    "PERFECT": "#ffffff", "GREAT": "#ffd700", "GOOD": "#00cc00",
+    "OK": "#4488ff", "MEH": "#888888", "MISS": "#ff2200",
+}
+PREVIEW_COL_WIDTH = 50
+PREVIEW_COL_GAP = 4
+PREVIEW_AXIS_W = 55
+PREVIEW_PAD = 10
+PREVIEW_TOP = 20
+PREVIEW_SCALE = 0.12
+
+
+def build_preview_data(notes, offsets, windows, scorev2):
+    """Build preview entries matching analyzer judgment counts."""
+    offset_map = {}
+    release_map = {}  # (end_time, col) -> release_time
+    for o in offsets:
+        if o["offset_ms"] is None:
+            continue
+        key = (o["hit_time_ms"], o["column"])
+        offset_map.setdefault(key, []).append(o)
+        if o["type"] == "hold_tail":
+            release_map[(o["hit_time_ms"], o["column"])] = o["event_time_ms"]
+
+    result = []
+    for n in notes:
+        key = (n["time"], n["column"])
+        entries = offset_map.get(key, [])
+        is_hold = n["type"] == "hold"
+        end_t = n.get("end_time", 0) or 0
+
+        if not entries:
+            result.append({
+                "column": n["column"], "hit_time": n["time"],
+                "end_time": end_t, "is_hold": is_hold, "is_tail": False,
+                "judgment": "MISS", "event_time": None, "release_time": None,
+            })
+            if is_hold and end_t and scorev2:
+                rt = release_map.get((end_t, n["column"]))
+                result.append({
+                    "column": n["column"], "hit_time": end_t,
+                    "end_time": 0, "is_hold": False, "is_tail": True,
+                    "judgment": "MISS", "event_time": rt, "release_time": None,
+                })
+            continue
+
+        if is_hold and not scorev2:
+            combined = [e for e in entries if e["type"] == "hold"]
+            if combined:
+                c = combined[0]
+                jdg = classify_combined_hold(c["head_offset"], c["tail_offset"], windows)
+                rt = release_map.get((end_t, n["column"]))
+                result.append({
+                    "column": n["column"], "hit_time": n["time"],
+                    "end_time": end_t, "is_hold": True, "is_tail": False,
+                    "judgment": jdg, "event_time": entries[0].get("event_time_ms"),
+                    "release_time": rt,
+                })
+                continue
+
+        # ScoreV2: produce head + tail as separate entries
+        for e in entries:
+            if e["type"] in ("tap", "hold_head") and e["offset_ms"] is not None:
+                jdg = classify_judgment(e["offset_ms"], windows)
+                head_et = e["event_time_ms"]
+                tail_release = None
+                if is_hold and end_t:
+                    te = next((x for x in offset_map.get((end_t, n["column"]), [])
+                               if x["type"] == "hold_tail" and x["offset_ms"] is not None), None)
+                    if te is not None:
+                        tail_release = te["event_time_ms"]
+                result.append({
+                    "column": n["column"], "hit_time": n["time"],
+                    "end_time": end_t, "is_hold": is_hold, "is_tail": False,
+                    "judgment": jdg, "event_time": head_et,
+                    "release_time": tail_release,
+                })
+                # Tail entry for stats (no note block)
+                if is_hold and te is not None:
+                    tail_win = {k: v * 1.5 for k, v in windows.items()}
+                    tail_jdg = classify_judgment(te["offset_ms"], tail_win if scorev2 else windows)
+                    result.append({
+                        "column": n["column"], "hit_time": end_t,
+                        "end_time": 0, "is_hold": False, "is_tail": True,
+                        "judgment": tail_jdg,
+                        "event_time": te["event_time_ms"],
+                        "release_time": None,
+                    })
+                break
+    return result
+
+
+def render_beatmap_svg(notes, preview_data, cs, max_time_ms,
+                       scale=0.12, reverse=False):
+    col_w = PREVIEW_COL_WIDTH
+    col_gap = PREVIEW_COL_GAP
+    axis_w = PREVIEW_AXIS_W
+    pad = PREVIEW_PAD
+    top = PREVIEW_TOP
+    bg = "#111"
+    text_color = "#aaa"
+    grid_color = "#333"
+
+    svg_w = pad + axis_w + pad + cs * (col_w + col_gap) + pad
+    svg_h = int(max_time_ms * scale) + top + 40
+
+    def time_to_y(t):
+        if reverse:
+            return (max_time_ms - t) * scale + top
+        return t * scale + top
+
+    def col_x(c):
+        return pad + axis_w + pad + c * (col_w + col_gap)
+
+    note_w = col_w - 8
+    note_h = 24
+    press_h = 6
+    press_w = col_w * 0.52
+    note_ox = (col_w - note_w) / 2
+    press_ox = (col_w - press_w) / 2
+
+    lines = []
+    lines.append(f'<svg width="{svg_w}" height="{svg_h}" xmlns="http://www.w3.org/2000/svg" '
+                 f'style="background:{bg};font-family:sans-serif;font-size:10px">')
+
+    # Grid lines (every 1000ms)
+    step_ms = 1000
+    for t in range(step_ms, int(max_time_ms) + step_ms, step_ms):
+        y = time_to_y(t)
+        if y < top - 5 or y > svg_h: break
+        lines.append(f'<line x1="0" y1="{y:.1f}" x2="{svg_w}" y2="{y:.1f}" '
+                     f'stroke="{grid_color}" stroke-width="0.5"/>')
+        lines.append(f'<text x="{pad}" y="{y - 2:.1f}" fill="{text_color}">{t // 1000}s</text>')
+
+    # Column labels
+    for c in range(cs):
+        x = col_x(c) + col_w / 2
+        lines.append(f'<text x="{x}" y="{top - 5}" text-anchor="middle" fill="{text_color}" '
+                     f'font-size="11">K{c}</text>')
+
+    # Draw notes and presses
+    for pd in preview_data:
+        c = pd["column"]
+        ht = pd["hit_time"]
+        et = pd["event_time"]
+        is_hold = pd["is_hold"]
+        is_tail = pd.get("is_tail", False)
+        rt = pd.get("release_time")
+        jdg = pd["judgment"]
+        color = PREVIEW_COLORS.get(jdg, "#888")
+
+        nx = col_x(c) + note_ox
+        px = col_x(c) + press_ox
+
+        # Skip LN body and note block for tail entries
+        if not is_tail:
+            # LN body: full-width rect from head to tail
+            if is_hold and pd.get("end_time"):
+                y_s = time_to_y(ht)
+                y_e = time_to_y(pd["end_time"])
+                y_min = min(y_s, y_e)
+                body_h = max(abs(y_e - y_s), 1)
+                lines.append(f'<rect x="{nx:.1f}" y="{y_min:.1f}" width="{note_w}" '
+                             f'height="{body_h:.1f}" fill="{color}" opacity="0.20" rx="1"/>')
+
+            # Note block: filled rect with border
+            y_note = time_to_y(ht) - note_h / 2
+            lines.append(f'<rect x="{nx:.1f}" y="{y_note:.1f}" width="{note_w}" '
+                         f'height="{note_h}" fill="{color}" opacity="0.25" rx="2"/>')
+            lines.append(f'<rect x="{nx:.1f}" y="{y_note:.1f}" width="{note_w}" '
+                         f'height="{note_h}" fill="none" stroke="{color}" '
+                         f'stroke-width="2" rx="2"/>')
+
+        # Press overlay at event_time (for both head and tail)
+        if et is not None:
+            y_press = time_to_y(et) - press_h / 2
+            lines.append(f'<rect x="{px:.1f}" y="{y_press:.1f}" width="{press_w}" '
+                         f'height="{press_h}" fill="{color}" rx="1"/>')
+
+        # Press hold bar: from event_time to release_time (or end_time as fallback)
+        if et is not None:
+            hold_end = rt if rt else pd.get("end_time")
+            if hold_end and hold_end > et:
+                y_ps = time_to_y(et)
+                y_pe = time_to_y(hold_end)
+                y_pmin = min(y_ps, y_pe)
+                p_h = max(abs(y_pe - y_ps), 1)
+                lines.append(f'<rect x="{px:.1f}" y="{y_pmin:.1f}" width="{press_w}" '
+                             f'height="{p_h:.1f}" fill="{color}" rx="1" opacity="0.30"/>')
+
+    lines.append('</svg>')
+    return "".join(lines)
+
+
+def update_preview(state, zoom, reverse):
+    if not state or not state.get("beatmap_notes"):
+        return '<div style="height:520px;border:1px solid #333;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#666;background:#111">请先分析一个回放</div>'
+    notes = state["beatmap_notes"]
+    cs = state["meta"]["cs"]
+    windows = state["windows"]
+    scorev2 = state["scorev2"]
+    offsets = state["all_offsets"]
+    pd = build_preview_data(notes, offsets, windows, scorev2)
+    max_t = max(
+        max((n.get("end_time", 0) or 0) for n in notes),
+        max(n["time"] for n in notes) if notes else 0)
+    svg = render_beatmap_svg(notes, pd, cs, max_t, scale=zoom, reverse=reverse)
+    return f'<div style="height:520px;overflow-y:auto;border:1px solid #333;border-radius:6px;background:#111">{svg}</div>'
+
+
 def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
-    NONE14 = [None] * 14
+    NONE18 = [None] * 18
 
     if osr_file_obj is None:
-        return NONE14[:1] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
+        return NONE18[:1] + [gr.Dataframe(value=None)] * 5 + NONE18[6:]
 
     osr_bytes = osr_file_obj if isinstance(osr_file_obj, bytes) else open(osr_file_obj, "rb").read()
     osr_path = os.path.join(TEMP_DIR, "upload.osr")
@@ -299,10 +557,10 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
     try:
         replay = OsuReplay.from_file(osr_path)
     except Exception as e:
-        return [gr.Markdown(f"⛔ .osr 解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
+        return [gr.Markdown(f"⛔ .osr 解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE18[6:]
 
     if replay.game_mode != GameMode.MANIA:
-        return [gr.Markdown("⛔ 仅支持 osu!mania 模式 (game_mode=3)")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
+        return [gr.Markdown("⛔ 仅支持 osu!mania 模式 (game_mode=3)")] + [gr.Dataframe(value=None)] * 5 + NONE18[6:]
 
     beatmap_md5 = replay.beatmap_md5
     player = replay.player_name
@@ -316,23 +574,34 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
             f.write(osu_bytes)
 
     if osu_path is None or not os.path.exists(osu_path):
+        settings = load_settings()
+        songs_path = settings.get("songs_path", "")
+        osu_path = find_osu_by_filename(osr_path, songs_path)
+    if osu_path is None or not os.path.exists(osu_path):
         osu_path = find_osu_by_md5(beatmap_md5)
 
     if osu_path is None or not os.path.exists(osu_path):
+        replay_name = os.path.basename(osr_path)
+        parsed = parse_replay_filename(replay_name)
+        extra = ""
+        if parsed:
+            extra = (f"\n文件名解析成功: **{parsed['artist']}** — "
+                     f"**{parsed['title']}** [{parsed['difficulty']}]"
+                     f"\n但在 Songs 目录未找到匹配的 .osu 文件")
         return [gr.Markdown(
             f"✅ 回放已读取 (玩家: {player}, 模组: {mods_names})\n\n"
-            f"⛔ 未找到对应谱面 (MD5: {beatmap_md5})\n"
-            f"请上传 .osu 或配置 Songs 路径")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
+            f"⛔ 未找到对应谱面 (MD5: {beatmap_md5}){extra}\n"
+            f"请上传对应的 .osu 文件或检查 Songs 路径配置")] + [gr.Dataframe(value=None)] * 5 + NONE18[6:]
 
     try:
         notes, cs, od, meta = parse_beatmap(osu_path)
     except Exception as e:
-        return [gr.Markdown(f"⛔ .osu 解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
+        return [gr.Markdown(f"⛔ .osu 解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE18[6:]
 
     try:
         player2, mods_v, mods_n, frames = parse_replay_frames(osr_path)
     except Exception as e:
-        return [gr.Markdown(f"⛔ Replay 帧解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
+        return [gr.Markdown(f"⛔ Replay 帧解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE18[6:]
 
     scorev2 = bool(replay.mods & ModsBit.SCORE_V2)
     windows = compute_windows(od, scorev2=scorev2)
@@ -432,9 +701,21 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
         "press_durations": dict(press_durations),
         "osu_judgments": osu_jdg,
         "scorev2": scorev2,
+        "beatmap_notes": notes,
     }
 
     col_choices = [str(c) for c in sorted_cols]
+
+    # Build beatmap preview
+    preview_data = build_preview_data(notes, offsets, windows, scorev2)
+    max_time = max(
+        max((n.get("end_time", 0) or 0) for n in notes),
+        max(n["time"] for n in notes) if notes else 0,
+    )
+    preview_scale = 0.12
+    preview_svg = render_beatmap_svg(notes, preview_data, cs, max_time,
+                                     scale=preview_scale, reverse=False)
+    preview_html = f'<div style="height:520px;overflow-y:auto;border:1px solid #333;border-radius:6px;background:#111">{preview_svg}</div>'
 
     return [
         gr.Markdown(status_text),
@@ -451,25 +732,31 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
         state,
         gr.Radio(value="press (tap+head)", choices=MODE_LABELS),
         gr.CheckboxGroup(value=col_choices, choices=col_choices, label="显示列", interactive=True),
-        build_histogram_figure(state, "press (tap+head)", col_choices),
+        build_histogram_figure(state, "press (tap+head)", col_choices, 80),
         build_press_time_figure(state),
         gr.Slider(minimum=500, maximum=10000, value=2000, step=100,
                   label="滑动窗口大小 (ms)"),
+        gr.Slider(minimum=10, maximum=200, value=80, step=5,
+                  label="直方图 bin 数量"),
         *build_rolling_charts(state, 2000),
+        gr.HTML(value=preview_html),
+        gr.Slider(minimum=0.04, maximum=0.40, value=0.12, step=0.01,
+                  label="缩放 (像素/ms)"),
+        gr.Checkbox(value=False, label="反向 (时间向上)"),
     ]
 
 
 def save_songs_path(path):
-    cfg = load_config()
+    cfg = load_settings()
     cfg["songs_path"] = path
-    save_config(cfg)
+    save_settings(cfg)
     exists = os.path.isdir(path)
     return gr.Markdown(f"已保存: {path}\n{'✅ 目录存在' if exists else '⛔ 目录不存在'}")
 
 
 def build_ui():
-    config = load_config()
-    songs_path = config.get("songs_path", "")
+    settings = load_settings()
+    songs_path = settings.get("songs_path", "")
 
     with gr.Blocks(title="osu!mania Replay Offset Analyzer",
                    theme=gr.themes.Soft()) as demo:
@@ -521,6 +808,8 @@ def build_ui():
                                   label="显示模式", interactive=True)
             col_checkbox = gr.CheckboxGroup(choices=[], value=[], label="显示列",
                                             interactive=True)
+            bin_slider = gr.Slider(minimum=10, maximum=200, value=80, step=5,
+                                   label="直方图 bin 数", scale=1)
 
         gr.HTML("""
 <style>
@@ -555,6 +844,13 @@ def build_ui():
         rolling_avg_plot = gr.Plot(label="平均偏移随时间变化")
         ur_plot = gr.Plot(label="UR 随时间变化 (std × 10)")
 
+        # --- Beatmap preview ---
+        with gr.Row():
+            zoom_slider = gr.Slider(minimum=0.04, maximum=0.40, value=0.12, step=0.01,
+                                    label="缩放 (像素/ms)", scale=3)
+            direction_checkbox = gr.Checkbox(value=False, label="反向 (时间向上)", scale=1)
+        preview_html = gr.HTML(value="<div style='height:520px;border:1px solid #333;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#666;background:#111'>请先分析一个回放</div>")
+
         # Events
         analyze_btn.click(
             fn=run_analysis,
@@ -563,13 +859,14 @@ def build_ui():
                      merged_table, comparison_table,
                      state, mode_radio, col_checkbox,
                      dist_plot, press_time_plot,
-                     window_slider, rolling_avg_plot, ur_plot],
+                     window_slider, bin_slider, rolling_avg_plot, ur_plot,
+                     preview_html, zoom_slider, direction_checkbox],
         )
 
-        for trigger in [mode_radio, col_checkbox]:
+        for trigger in [mode_radio, col_checkbox, bin_slider]:
             trigger.change(
                 fn=build_histogram_figure,
-                inputs=[state, mode_radio, col_checkbox],
+                inputs=[state, mode_radio, col_checkbox, bin_slider],
                 outputs=dist_plot,
             )
 
@@ -578,6 +875,13 @@ def build_ui():
             inputs=[state, window_slider],
             outputs=[rolling_avg_plot, ur_plot],
         )
+
+        for trigger in [zoom_slider, direction_checkbox]:
+            trigger.change(
+                fn=update_preview,
+                inputs=[state, zoom_slider, direction_checkbox],
+                outputs=preview_html,
+            )
 
         save_path_btn.click(fn=save_songs_path, inputs=songs_path_input,
                             outputs=save_path_msg)
