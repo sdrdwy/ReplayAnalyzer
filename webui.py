@@ -214,12 +214,12 @@ def build_press_time_figure(state):
         color = COLORS_PALETTE[idx % len(COLORS_PALETTE)]
         avg = statistics.mean(durs)
         sd = statistics.pstdev(durs)
-        hist, edges = np.histogram(durs, bins=40)
+        hist, edges = np.histogram(durs, bins=120)
         centers = (edges[:-1] + edges[1:]) / 2
         fig.add_trace(go.Scatter(
-            x=centers, y=hist, mode="lines+markers",
+            x=centers, y=hist, mode="lines",
             name=f"K{col} (n={len(durs)}, μ={avg:.1f}ms, σ={sd:.1f}ms)",
-            line=dict(color=color), marker=dict(color=color, size=4),
+            line=dict(color=color, width=1.2),
         ))
 
     fig.update_layout(
@@ -233,44 +233,63 @@ def build_press_time_figure(state):
     return fig
 
 
-def build_pie_figure(overall_stats):
-    if not overall_stats:
-        return go.Figure()
-    fig = go.Figure()
-    for idx, typ in enumerate(["tap", "hold_head", "hold_tail"]):
-        if typ not in overall_stats:
-            continue
-        jdg_counts = overall_stats[typ].get("judgment_counts", {})
-        labels = [j for j in JUDGMENT_ORDER if jdg_counts.get(j, 0) > 0]
-        values = [jdg_counts.get(j, 0) for j in labels]
-        colors = [JUDGMENT_COLORS.get(j, "#888") for j in labels]
-        fig.add_trace(go.Pie(
-            labels=labels, values=values,
-            name=typ, domain=dict(row=0, column=idx),
-            marker_colors=colors, hole=0.3,
-            textinfo="label+percent", textfont_size=10,
-        ))
-    title_map = {"tap": "Tap", "hold_head": "Hold Head", "hold_tail": "Hold Tail"}
-    annotations = []
-    for idx, typ in enumerate(["tap", "hold_head", "hold_tail"]):
-        if typ in overall_stats:
-            annotations.append(dict(
-                text=f"{title_map[typ]} (n={overall_stats[typ]['count']})",
-                x=idx / 2, y=1.05, showarrow=False, font=dict(size=11),
-                xref="paper", yref="paper"))
-    fig.update_layout(
-        title="Judgment Distribution by Type",
-        grid=dict(rows=1, columns=3),
-        annotations=annotations,
-        height=350,
-        margin=dict(t=50, b=30),
+def build_rolling_charts(state, window_size_ms):
+    if not state:
+        return go.Figure(), go.Figure()
+    offsets = state.get("all_offsets", [])
+    valid = sorted(
+        [(o["hit_time_ms"], o["offset_ms"])
+         for o in offsets if o["offset_ms"] is not None],
+        key=lambda x: x[0])
+    if len(valid) < 2:
+        return go.Figure(), go.Figure()
+
+    times = [v[0] for v in valid]
+    vals = [v[1] for v in valid]
+    half = window_size_ms / 2.0
+    t_min, t_max = times[0], times[-1]
+    step = max(int(window_size_ms // 4), 1)
+    positions = list(range(int(t_min + half), int(t_max - half + 1), step))
+
+    pos_times, means, urs = [], [], []
+    for center in positions:
+        lo, hi = center - half, center + half
+        w = [v for t, v in zip(times, vals) if lo <= t <= hi]
+        if len(w) >= 2:
+            pos_times.append(center / 1000.0)
+            means.append(statistics.mean(w))
+            urs.append(statistics.pstdev(w) * 10)
+
+    fig_avg = go.Figure()
+    fig_avg.add_trace(go.Scatter(
+        x=pos_times, y=means, mode="lines",
+        name="Avg Offset", line=dict(width=1.5, color="#4363d8")))
+    fig_avg.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig_avg.update_layout(
+        title="Average Offset over Time",
+        xaxis_title="Time (s)", yaxis_title="Offset (ms)",
+        margin=dict(t=40, r=30, b=40, l=50), height=280,
+        hovermode="x unified",
     )
-    return fig
+
+    fig_ur = go.Figure()
+    fig_ur.add_trace(go.Scatter(
+        x=pos_times, y=urs, mode="lines",
+        name="UR", line=dict(width=1.5, color="#ff6600")))
+    fig_ur.update_layout(
+        title="Unstable Rate over Time (std × 10)",
+        xaxis_title="Time (s)", yaxis_title="UR",
+        margin=dict(t=40, r=30, b=40, l=50), height=280,
+        hovermode="x unified",
+    )
+    return fig_avg, fig_ur
 
 
 def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
+    NONE14 = [None] * 14
+
     if osr_file_obj is None:
-        return [gr.Markdown("⛔ 请上传 .osr 文件")] + [gr.Dataframe(value=None)] * 5 + [None, None, None, None, None, None]
+        return NONE14[:1] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
 
     osr_bytes = osr_file_obj if isinstance(osr_file_obj, bytes) else open(osr_file_obj, "rb").read()
     osr_path = os.path.join(TEMP_DIR, "upload.osr")
@@ -280,10 +299,10 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
     try:
         replay = OsuReplay.from_file(osr_path)
     except Exception as e:
-        return [gr.Markdown(f"⛔ .osr 解析失败: {e}")] + [gr.Dataframe(value=None)] * 10
+        return [gr.Markdown(f"⛔ .osr 解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
 
     if replay.game_mode != GameMode.MANIA:
-        return [gr.Markdown("⛔ 仅支持 osu!mania 模式 (game_mode=3)")] + [gr.Dataframe(value=None)] * 10
+        return [gr.Markdown("⛔ 仅支持 osu!mania 模式 (game_mode=3)")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
 
     beatmap_md5 = replay.beatmap_md5
     player = replay.player_name
@@ -303,17 +322,17 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
         return [gr.Markdown(
             f"✅ 回放已读取 (玩家: {player}, 模组: {mods_names})\n\n"
             f"⛔ 未找到对应谱面 (MD5: {beatmap_md5})\n"
-            f"请上传 .osu 或配置 Songs 路径")] + [gr.Dataframe(value=None)] * 10
+            f"请上传 .osu 或配置 Songs 路径")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
 
     try:
         notes, cs, od, meta = parse_beatmap(osu_path)
     except Exception as e:
-        return [gr.Markdown(f"⛔ .osu 解析失败: {e}")] + [gr.Dataframe(value=None)] * 10
+        return [gr.Markdown(f"⛔ .osu 解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
 
     try:
         player2, mods_v, mods_n, frames = parse_replay_frames(osr_path)
     except Exception as e:
-        return [gr.Markdown(f"⛔ Replay 帧解析失败: {e}")] + [gr.Dataframe(value=None)] * 10
+        return [gr.Markdown(f"⛔ Replay 帧解析失败: {e}")] + [gr.Dataframe(value=None)] * 5 + NONE14[6:]
 
     scorev2 = bool(replay.mods & ModsBit.SCORE_V2)
     windows = compute_windows(od, scorev2=scorev2)
@@ -434,7 +453,9 @@ def run_analysis(osr_file_obj, osu_file_obj, songs_path_text):
         gr.CheckboxGroup(value=col_choices, choices=col_choices, label="显示列", interactive=True),
         build_histogram_figure(state, "press (tap+head)", col_choices),
         build_press_time_figure(state),
-        build_pie_figure(overall_stats),
+        gr.Slider(minimum=500, maximum=10000, value=2000, step=100,
+                  label="滑动窗口大小 (ms)"),
+        *build_rolling_charts(state, 2000),
     ]
 
 
@@ -527,9 +548,12 @@ def build_ui():
                 press_time_plot = gr.Plot(label="按压时长分布 (PressTime)", elem_id="press-plot")
                 gr.HTML('<button class="fs-btn" onclick="document.getElementById(\'press-plot\').closest(\'.fs-wrap\').requestFullscreen()">⛶</button>')
 
-        with gr.Column(elem_classes="fs-wrap"):
-            pie_plot = gr.Plot(label="判定分布饼图", elem_id="pie-plot")
-            gr.HTML('<button class="fs-btn" onclick="document.getElementById(\'pie-plot\').closest(\'.fs-wrap\').requestFullscreen()">⛶</button>')
+        # --- Rolling charts (replaces pie) ---
+        window_slider = gr.Slider(
+            minimum=500, maximum=10000, value=2000, step=100,
+            label="滑动窗口大小 (ms)")
+        rolling_avg_plot = gr.Plot(label="平均偏移随时间变化")
+        ur_plot = gr.Plot(label="UR 随时间变化 (std × 10)")
 
         # Events
         analyze_btn.click(
@@ -538,7 +562,8 @@ def build_ui():
             outputs=[status, summary_table, detail_table, overall_table,
                      merged_table, comparison_table,
                      state, mode_radio, col_checkbox,
-                     dist_plot, press_time_plot, pie_plot],
+                     dist_plot, press_time_plot,
+                     window_slider, rolling_avg_plot, ur_plot],
         )
 
         for trigger in [mode_radio, col_checkbox]:
@@ -547,6 +572,12 @@ def build_ui():
                 inputs=[state, mode_radio, col_checkbox],
                 outputs=dist_plot,
             )
+
+        window_slider.change(
+            fn=build_rolling_charts,
+            inputs=[state, window_slider],
+            outputs=[rolling_avg_plot, ur_plot],
+        )
 
         save_path_btn.click(fn=save_songs_path, inputs=songs_path_input,
                             outputs=save_path_msg)
