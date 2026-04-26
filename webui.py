@@ -156,7 +156,7 @@ def compute_press_durations(frames, cs):
                         if active[col] is not None:
                             dur = t - active[col]
                             if 0 < dur < 5000:
-                                by_col[col].append(dur)
+                                by_col[col].append((active[col], dur))
                             active[col] = None
         prev_x = x
     return by_col
@@ -263,7 +263,7 @@ def build_press_time_figure(state):
 
     fig = go.Figure()
     for idx, col in enumerate(sorted(pds.keys())):
-        durs = pds[col]
+        durs = [d for _, d in pds[col]]
         if not durs:
             continue
         color = COLORS_PALETTE[idx % len(COLORS_PALETTE)]
@@ -301,19 +301,17 @@ def build_rolling_charts(state, window_size_ms):
 
     times = [v[0] for v in valid]
     vals = [v[1] for v in valid]
-    half = window_size_ms / 2.0
     t_min, t_max = times[0], times[-1]
-    step = max(int(window_size_ms // 4), 1)
-    positions = list(range(int(t_min + half), int(t_max - half + 1), step))
+    step = max(int((t_max - t_min) / 200), 1)
+    positions = list(range(int(t_min), int(t_max + 1), step))
 
     pos_times, means, urs = [], [], []
     for center in positions:
-        lo, hi = center - half, center + half
-        w = [v for t, v in zip(times, vals) if lo <= t <= hi]
-        if len(w) >= 2:
+        cumulative = [v for t, v in zip(times, vals) if t <= center]
+        if len(cumulative) >= 2:
             pos_times.append(center / 1000.0)
-            means.append(statistics.mean(w))
-            urs.append(statistics.pstdev(w) * 10)
+            means.append(statistics.mean(cumulative))
+            urs.append(statistics.pstdev(cumulative) * 10)
 
     fig_avg = go.Figure()
     fig_avg.add_trace(go.Scatter(
@@ -321,7 +319,7 @@ def build_rolling_charts(state, window_size_ms):
         name="Avg Offset", line=dict(width=1.5, color="#4363d8")))
     fig_avg.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     fig_avg.update_layout(
-        title="Average Offset over Time",
+        title="Average Offset (cumulative)",
         xaxis_title="Time (s)", yaxis_title="Offset (ms)",
         margin=dict(t=40, r=30, b=40, l=50), height=280,
         hovermode="x unified",
@@ -332,7 +330,7 @@ def build_rolling_charts(state, window_size_ms):
         x=pos_times, y=urs, mode="lines",
         name="UR", line=dict(width=1.5, color="#ff6600")))
     fig_ur.update_layout(
-        title="Unstable Rate over Time (std × 10)",
+        title="Unstable Rate (cumulative, std × 10)",
         xaxis_title="Time (s)", yaxis_title="UR",
         margin=dict(t=40, r=30, b=40, l=50), height=280,
         hovermode="x unified",
@@ -557,7 +555,7 @@ def render_beatmap_svg(notes, preview_data, cs, max_time_ms,
 
 
 def build_range_rolling_charts(filtered_offsets, window_ms=2000):
-    """Rolling avg + UR line charts for a filtered offset set."""
+    """Cumulative avg + UR line charts for a filtered offset set."""
     valid = sorted(
         [(o["hit_time_ms"], o["offset_ms"])
          for o in filtered_offsets if o["offset_ms"] is not None],
@@ -569,31 +567,29 @@ def build_range_rolling_charts(filtered_offsets, window_ms=2000):
 
     times = [v[0] for v in valid]
     vals = [v[1] for v in valid]
-    half = window_ms / 2.0
-    t_min, t_max = times[0], times[-1]
-    step = max(int(window_ms // 4), 1)
-    positions = list(range(int(t_min + half), int(t_max - half + 1), step))
+    t_first, t_last = times[0], times[-1]
+    step = max(int((t_last - t_first) / 200), 1)
+    positions = list(range(int(t_first), int(t_last + 1), step))
 
     pos_t, means, urs = [], [], []
     for center in positions:
-        lo, hi = center - half, center + half
-        w = [v for t, v in zip(times, vals) if lo <= t <= hi]
-        if len(w) >= 2:
+        cumulative = [v for t, v in zip(times, vals) if t <= center]
+        if len(cumulative) >= 2:
             pos_t.append(center / 1000.0)
-            means.append(statistics.mean(w))
-            urs.append(statistics.pstdev(w) * 10)
+            means.append(statistics.mean(cumulative))
+            urs.append(statistics.pstdev(cumulative) * 10)
 
     fig_avg = go.Figure()
     fig_avg.add_trace(go.Scatter(x=pos_t, y=means, mode="lines",
         name="Avg Offset", line=dict(width=1.5, color="#4363d8")))
     fig_avg.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-    fig_avg.update_layout(title="区间 Avg Offset", xaxis_title="Time (s)",
+    fig_avg.update_layout(title="区间 Avg Offset (cumulative)", xaxis_title="Time (s)",
         yaxis_title="Offset (ms)", margin=dict(t=30, r=20, b=20, l=40), height=180, hovermode="x unified")
 
     fig_ur = go.Figure()
     fig_ur.add_trace(go.Scatter(x=pos_t, y=urs, mode="lines",
         name="UR", line=dict(width=1.5, color="#ff6600")))
-    fig_ur.update_layout(title="区间 UR", xaxis_title="Time (s)",
+    fig_ur.update_layout(title="区间 UR (cumulative)", xaxis_title="Time (s)",
         yaxis_title="UR", margin=dict(t=30, r=20, b=20, l=40), height=180, hovermode="x unified")
 
     return fig_avg, fig_ur
@@ -655,16 +651,14 @@ def update_range_view(state, t_range=None, zoom=None, reverse=None):
     # Range avg + UR curves
     fig_avg, fig_ur = build_range_rolling_charts(fo, 2000)
 
-    # Range press time (reuse from state's press_durations, filtered by hit_time)
+    # Range press time (filtered from state's press_durations by press time)
     pds = state.get("press_durations", {})
     fig_pt = go.Figure()
-    all_pds = []
     col_pds = {}
-    for o in fo:
-        if o["type"] in ("tap", "hold_head") and o["offset_ms"] is not None:
-            col = o["column"]
-            col_pds.setdefault(col, []).append(o["event_time_ms"] - o["hit_time_ms"])
-            all_pds.extend(col_pds[col])
+    for col, entries in pds.items():
+        filtered = [d for pt, d in entries if t_min <= pt <= t_max]
+        if filtered:
+            col_pds[col] = filtered
     for idx, (col, durs) in enumerate(sorted(col_pds.items())):
         if not durs: continue
         c = COLORS_PALETTE[idx % len(COLORS_PALETTE)]
@@ -675,7 +669,7 @@ def update_range_view(state, t_range=None, zoom=None, reverse=None):
         fig_pt.add_trace(go.Scatter(x=centers, y=hist, mode="lines",
             name=f"K{col} (n={len(durs)}, μ={avg_d:.1f}, σ={sd_d:.1f})",
             line=dict(width=1.2, color=c)))
-    fig_pt.update_layout(title="Press Duration (range)", xaxis_title="ms", yaxis_title="Count",
+    fig_pt.update_layout(title="Press Duration (range)", xaxis_title="Press Duration (ms)", yaxis_title="Count",
                          height=200, margin=dict(t=30, b=20, l=30, r=10), hovermode="x unified")
 
     # Range histogram
